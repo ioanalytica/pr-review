@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+#
+# pr-review - blind, isolated review of a PR branch before it is pushed.
+#
+# Builds a self-contained review package from the current repository:
+#   changes.patch         diff merge-base(BASE, HEAD)..HEAD
+#   changed-files.txt     paths touched by the diff
+#   src/                  full tree at HEAD, no .git, no CLAUDE.md/.claude
+#   lint.txt              output of the repo's lint layer (hook-driven)
+#   tests.txt             output of the repo's test layer (hook-driven)
+#   summary.txt           facts handed to the reviewer (shas, counts, rcs)
+#   BRIEF.md              the reviewer instructions actually used
+#   REVIEW.md             the reviewer's verdict (unless --no-review)
+#
+# Then runs `claude -p` inside that package with read-only tools, no MCP
+# servers, no settings, no memory, no session persistence, and none of the
+# calling Claude Code session's environment. The reviewer sees the package
+# and nothing else: no branch name, no commit messages, no chat history.
+#
+# Usage: pr-review [options] [BASE]
+#   BASE                 base ref (default: first of upstream/main, upstream/master,
+#                        origin/main, origin/master, main, master)
+#   --head REF           commit to review (default: HEAD)
+#   --quick              hook may narrow the test scope to touched tests
+#   --parallel           run tests while the reviewer works; the reviewer then
+#                        does not see tests.txt, the result is appended to REVIEW.md
+#   --no-lint            skip the lint layer
+#   --no-tests           skip the test layer
+#   --no-review          build the package only, do not call claude
+#   --model M            reviewer model (default: claude's default)
+#   --effort E           reviewer effort (default: high)
+#   --out FILE           copy REVIEW.md to FILE as well
+#   --hook FILE          hook file (default: .pr-review/hook.sh in the reviewed
+#                        tree, else ~/.config/pr-review/hooks/<repo>.sh)
+#   -h, --help           this text
+#
+# Hooks: a bash file that may define pr_review_lint and/or pr_review_test.
+# Lookup order: --hook FILE, then .pr-review/hook.sh in the reviewed tree
+# (so the hook can live next to the CI definition it mirrors), then
+# ~/.config/pr-review/hooks/<repo>.sh.
+# Both run with cwd=$SRC and see SRC, REPO, OUT, CACHE, CHANGED_FILES (a
+# file listing changed paths), QUICK (0/1), BASE_SHA, HEAD_SHA. stdout,
+# stderr and exit code are captured; a non-zero exit is reported to the
+# reviewer, not fatal. Without a hook, lint falls back to ruff/shellcheck
+# when present and tests are skipped.
+#
+# Environment: PR_REVIEW_DIR (package root, default $TMPDIR/pr-review),
+# PR_REVIEW_CONFIG (config dir), PR_REVIEW_CLAUDE_ARGS (extra reviewer args).
+#
+set -euo pipefail
+
+CONFIG_DIR="${PR_REVIEW_CONFIG:-$HOME/.config/pr-review}"
+BRIEF="$CONFIG_DIR/BRIEF.md"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/pr-review"
+TMP="${TMPDIR:-/tmp}"
+PKG_ROOT="${PR_REVIEW_DIR:-${TMP%/}/pr-review}"
+
+BASE=""
+HEAD_REF="HEAD"
+QUICK=0
+PARALLEL=0
+DO_LINT=1
+DO_TESTS=1
+DO_REVIEW=1
+MODEL=""
+EFFORT="high"
+OUT_COPY=""
+HOOK=""
+
+usage() { sed -n '3,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
+die() { echo "pr-review: $*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --head) HEAD_REF="${2:?--head needs a value}"; shift ;;
+    --quick) QUICK=1 ;;
+    --parallel) PARALLEL=1 ;;
+    --no-lint) DO_LINT=0 ;;
+    --no-tests) DO_TESTS=0 ;;
+    --no-review) DO_REVIEW=0 ;;
+    --model) MODEL="${2:?--model needs a value}"; shift ;;
+    --effort) EFFORT="${2:?--effort needs a value}"; shift ;;
+    --out) OUT_COPY="${2:?--out needs a value}"; shift ;;
+    --hook) HOOK="${2:?--hook needs a value}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown option: $1" ;;
+    *) [ -z "$BASE" ] || die "unexpected argument: $1"; BASE="$1" ;;
+  esac
+  shift
+done
+
+# --- repository facts -------------------------------------------------------
+REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
+REPO_NAME="$(basename "$REPO")"
+if [ -z "$BASE" ]; then
+  for candidate in upstream/main upstream/master origin/main origin/master main master; do
+    if git -C "$REPO" rev-parse --verify -q "$candidate^{commit}" >/dev/null; then
+      BASE="$candidate"; break
+    fi
+  done
+  [ -n "$BASE" ] || die "no base ref found, pass one explicitly"
+fi
+git -C "$REPO" rev-parse --verify -q "$BASE^{commit}" >/dev/null || die "base ref not found: $BASE"
+
+HEAD_SHA="$(git -C "$REPO" rev-parse --verify -q "$HEAD_REF^{commit}")" || die "head ref not found: $HEAD_REF"
+BASE_SHA="$(git -C "$REPO" merge-base "$BASE" "$HEAD_SHA")" || die "no merge base between $BASE and $HEAD_REF"
+[ "$HEAD_SHA" != "$BASE_SHA" ] || die "$HEAD_REF is already contained in $BASE, nothing to review"
+if [ "$HEAD_REF" = "HEAD" ] && [ -n "$(git -C "$REPO" status --porcelain --untracked-files=no)" ]; then
+  echo "pr-review: note: working tree has uncommitted changes, only HEAD is reviewed" >&2
+fi
+
+[ -f "$BRIEF" ] || die "brief not found: $BRIEF"
+
+# --- package ----------------------------------------------------------------
+mkdir -p "$PKG_ROOT" "$CACHE"
+OUT="$(mktemp -d "$PKG_ROOT/$REPO_NAME-$(date +%Y%m%d-%H%M%S)-XXXX")"
+SRC="$OUT/src"
+CHANGED_FILES="$OUT/changed-files.txt"
+export SRC REPO OUT CACHE CHANGED_FILES QUICK BASE_SHA HEAD_SHA
+
+echo "pr-review: package $OUT"
+echo "pr-review: base    $BASE ($BASE_SHA)"
+echo "pr-review: head    $HEAD_REF ($HEAD_SHA)"
+
+git -C "$REPO" diff --no-color "$BASE_SHA" "$HEAD_SHA" > "$OUT/changes.patch"
+git -C "$REPO" diff --name-status "$BASE_SHA" "$HEAD_SHA" > "$OUT/changed-files-status.txt"
+git -C "$REPO" diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$CHANGED_FILES"
+N_FILES="$(wc -l < "$CHANGED_FILES" | tr -d ' ')"
+[ "$N_FILES" -gt 0 ] || die "diff is empty"
+
+# Full tree at HEAD without history. git archive works through submodule
+# gitfiles, which git worktree does not.
+mkdir -p "$SRC"
+git -C "$REPO" archive --format=tar "$HEAD_SHA" | tar -x -C "$SRC"
+
+# Strip everything Claude Code would auto-load while reading src/, so the
+# reviewer sees the code and not the author's assistant instructions.
+STRIPPED="$(cd "$SRC" && find . \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name .claude -o -name .mcp.json \) -prune -print | sed 's|^\./||')"
+if [ -n "$STRIPPED" ]; then
+  while IFS= read -r p; do rm -rf "${SRC:?}/$p"; done <<< "$STRIPPED"
+  printf '%s\n' "$STRIPPED" > "$OUT/stripped-from-src.txt"
+fi
+
+# --- hook + deterministic layers -------------------------------------------
+# A hook shipped in the reviewed tree wins over the user's config, so it can
+# follow the CI definition it mirrors. --hook overrides both.
+if [ -z "$HOOK" ]; then
+  if [ -f "$SRC/.pr-review/hook.sh" ]; then
+    HOOK="$SRC/.pr-review/hook.sh"
+  else
+    HOOK="$CONFIG_DIR/hooks/$REPO_NAME.sh"
+  fi
+fi
+if [ -f "$HOOK" ]; then
+  # shellcheck disable=SC1090
+  source "$HOOK"
+  echo "pr-review: hook    $HOOK"
+else
+  echo "pr-review: no hook for $REPO_NAME (looked for .pr-review/hook.sh and $HOOK), using fallbacks"
+fi
+
+# Fallback lint when the hook defines none.
+if ! declare -F pr_review_lint >/dev/null; then
+  pr_review_lint() {
+    local ran=0 sh_files
+    if command -v ruff >/dev/null && { [ -f pyproject.toml ] || [ -f ruff.toml ]; }; then
+      echo "== ruff check ."; ruff check . || true; ran=1
+    fi
+    if command -v shellcheck >/dev/null; then
+      sh_files="$(grep -E '\.(sh|bash)$' "$CHANGED_FILES" || true)"
+      if [ -n "$sh_files" ]; then
+        echo "== shellcheck (changed shell files)"
+        # shellcheck disable=SC2086
+        shellcheck $sh_files || true; ran=1
+      fi
+    fi
+    [ "$ran" -eq 1 ] || echo "(no linter applicable, define pr_review_lint in a hook)"
+  }
+fi
+
+# run_layer NAME FUNC FILE: captures output into FILE, prints the exit code.
+run_layer() {
+  local name="$1" func="$2" file="$3" rc=0
+  if ! declare -F "$func" >/dev/null; then
+    echo "($name: hook defines no $func, skipped)" > "$file"
+    echo "skipped"
+    return 0
+  fi
+  echo "pr-review: running $name ..." >&2
+  set +e
+  (cd "$SRC" && "$func") > "$file" 2>&1
+  rc=$?
+  set -e
+  echo "$rc"
+}
+
+LINT_RC="skipped"; TESTS_RC="skipped"; TESTS_PID=""
+[ "$DO_REVIEW" -eq 1 ] || PARALLEL=0
+if [ "$DO_LINT" -eq 1 ]; then
+  LINT_RC="$(run_layer lint pr_review_lint "$OUT/lint.txt")"
+else
+  echo "(lint: disabled with --no-lint)" > "$OUT/lint.txt"
+fi
+if [ "$DO_TESTS" -eq 0 ]; then
+  echo "(tests: disabled with --no-tests)" > "$OUT/tests.txt"
+elif [ "$PARALLEL" -eq 1 ]; then
+  run_layer tests pr_review_test "$OUT/tests.txt" > "$OUT/tests.rc" &
+  TESTS_PID=$!
+  TESTS_RC="pending"
+else
+  TESTS_RC="$(run_layer tests pr_review_test "$OUT/tests.txt")"
+fi
+
+# test_result_lines: pytest / vitest result lines from tests.txt, if any.
+test_result_lines() {
+  grep -E -m6 '(^=+ .*(passed|failed|error).* =+$|^[0-9]+ (passed|failed|error)|^ *Tests? +[0-9]+ |^ *Test Files +[0-9]+ )' "$OUT/tests.txt" 2>/dev/null || true
+}
+
+write_summary() {
+  {
+    echo "base:   $BASE_SHA"
+    echo "head:   $HEAD_SHA"
+    echo "files:  $N_FILES changed (changed-files.txt)"
+    echo "patch:  $(wc -l < "$OUT/changes.patch" | tr -d ' ') lines (changes.patch)"
+    echo "lint:   ${LINT_RC/#[0-9]*/exit $LINT_RC} (lint.txt)"
+    if [ "$TESTS_RC" = "pending" ]; then
+      echo "tests:  still running in parallel, not available to you (tests.txt is incomplete)"
+    else
+      echo "tests:  ${TESTS_RC/#[0-9]*/exit $TESTS_RC} (tests.txt)$( [ "$QUICK" -eq 1 ] && echo ', quick scope' )"
+      test_result_lines | sed 's/^/        /'
+    fi
+    [ -f "$OUT/stripped-from-src.txt" ] && echo "note:   assistant config removed from src/ (stripped-from-src.txt)"
+  } > "$OUT/summary.txt"
+}
+
+# --- summary + brief ---------------------------------------------------------
+write_summary
+
+cp "$BRIEF" "$OUT/BRIEF.md"
+{
+  echo
+  echo "## Package facts"
+  echo
+  echo '```'
+  cat "$OUT/summary.txt"
+  echo '```'
+} >> "$OUT/BRIEF.md"
+
+echo "pr-review: summary"
+sed 's/^/  /' "$OUT/summary.txt"
+
+if [ "$DO_REVIEW" -eq 0 ]; then
+  echo "pr-review: package built, review skipped: $OUT"
+  exit 0
+fi
+
+# --- reviewer ---------------------------------------------------------------
+command -v claude >/dev/null || die "claude CLI not found"
+
+# Drop every variable of a calling Claude Code session so the reviewer
+# cannot inherit its identity, sockets, or effort setting.
+SCRUB=()
+while IFS= read -r v; do SCRUB+=(-u "$v"); done < <(env | grep -o -E '^(CLAUDE[A-Z0-9_]*|USE_LOCAL_OAUTH|USE_STAGING_OAUTH|BAGGAGE|AI_AGENT)=' | tr -d '=')
+
+CLAUDE_ARGS=(
+  -p
+  --tools "Read,Grep,Glob"
+  --allowedTools "Read,Grep,Glob"
+  --permission-mode dontAsk
+  --strict-mcp-config
+  --setting-sources ""
+  --no-session-persistence
+  --effort "$EFFORT"
+  --output-format text
+)
+[ -n "$MODEL" ] && CLAUDE_ARGS+=(--model "$MODEL")
+if [ -n "${PR_REVIEW_CLAUDE_ARGS:-}" ]; then
+  # shellcheck disable=SC2206
+  CLAUDE_ARGS+=(${PR_REVIEW_CLAUDE_ARGS})
+fi
+
+echo "pr-review: running reviewer (effort $EFFORT${MODEL:+, model $MODEL}) ..."
+set +e
+(
+  cd "$OUT" &&
+  env ${SCRUB[@]+"${SCRUB[@]}"} claude "${CLAUDE_ARGS[@]}" "$(cat BRIEF.md)" < /dev/null
+) > "$OUT/REVIEW.md" 2> "$OUT/reviewer.stderr"
+RC=$?
+set -e
+
+if [ "$RC" -ne 0 ] || [ ! -s "$OUT/REVIEW.md" ]; then
+  # The CLI prints auth and usage errors on stdout, so keep that out of REVIEW.md.
+  [ -z "$TESTS_PID" ] || { wait "$TESTS_PID" || true; }
+  mv "$OUT/REVIEW.md" "$OUT/REVIEW.failed.txt"
+  echo "pr-review: reviewer failed (exit $RC), see $OUT/REVIEW.failed.txt and reviewer.stderr" >&2
+  { tail -5 "$OUT/REVIEW.failed.txt"; tail -5 "$OUT/reviewer.stderr"; } 2>/dev/null | sed 's/^/  /' >&2
+  exit 1
+fi
+if [ -n "$TESTS_PID" ]; then
+  echo "pr-review: waiting for tests ..."
+  wait "$TESTS_PID" || true
+  TESTS_RC="$(cat "$OUT/tests.rc")"
+  write_summary
+  {
+    echo
+    echo "## Test layer (ran in parallel, not seen by the reviewer)"
+    echo
+    echo "exit $TESTS_RC$( [ "$QUICK" -eq 1 ] && echo ', quick scope' ), see tests.txt"
+    echo
+    test_result_lines | sed 's/^/    /'
+    if [ "$TESTS_RC" != "0" ]; then
+      echo
+      echo "Failures (tail of tests.txt):"
+      echo
+      tail -40 "$OUT/tests.txt" | sed 's/^/    /'
+    fi
+  } >> "$OUT/REVIEW.md"
+  echo "pr-review: tests ${TESTS_RC/#[0-9]*/exit $TESTS_RC}"
+  test_result_lines | sed 's/^/  /'
+fi
+[ -n "$OUT_COPY" ] && cp "$OUT/REVIEW.md" "$OUT_COPY"
+echo "pr-review: review written to $OUT/REVIEW.md${OUT_COPY:+ (copy: $OUT_COPY)}"
