@@ -11,6 +11,7 @@
 #   summary.txt           facts handed to the reviewer (shas, counts, rcs)
 #   BRIEF.md              the reviewer instructions actually used
 #   REVIEW.md             the reviewer's verdict (unless --no-review)
+#   coderabbit.txt        CodeRabbit CLI review of the same range (--coderabbit)
 #
 # Then runs `claude -p` inside that package with read-only tools, no MCP
 # servers, no settings, no memory, no session persistence, and none of the
@@ -27,6 +28,9 @@
 #   --no-lint            skip the lint layer
 #   --no-tests           skip the test layer
 #   --no-review          build the package only, do not call claude
+#   --coderabbit         also run the CodeRabbit CLI on the same range, in
+#                        parallel; the reviewer does not see its output, the
+#                        result is appended to REVIEW.md (see below)
 #   --model M            reviewer model (default: claude's default)
 #   --effort E           reviewer effort (default: high)
 #   --out FILE           copy REVIEW.md to FILE as well
@@ -44,8 +48,17 @@
 # reviewer, not fatal. Without a hook, lint falls back to ruff/shellcheck
 # when present and tests are skipped.
 #
+# CodeRabbit: --coderabbit runs `coderabbit review --committed --base-commit
+# BASE` as a second, independent opinion. The CLI is a cloud service: the
+# diff leaves the machine, so this is opt-in per run, and a hook may set
+# PR_REVIEW_NO_CODERABBIT=1 to refuse it for a repository. The CLI needs a
+# git worktree and computes the diff itself, so it runs in the real checkout
+# when HEAD is reviewed and in a throwaway local clone under the package for
+# --head. Needs `coderabbit auth login` once.
+#
 # Environment: PR_REVIEW_DIR (package root, default $TMPDIR/pr-review),
-# PR_REVIEW_CONFIG (config dir), PR_REVIEW_CLAUDE_ARGS (extra reviewer args).
+# PR_REVIEW_CONFIG (config dir), PR_REVIEW_CLAUDE_ARGS (extra reviewer args),
+# PR_REVIEW_CODERABBIT_TIMEOUT (seconds to wait for CodeRabbit, default 900).
 #
 set -euo pipefail
 
@@ -62,6 +75,7 @@ PARALLEL=0
 DO_LINT=1
 DO_TESTS=1
 DO_REVIEW=1
+CODERABBIT=0
 MODEL=""
 EFFORT="high"
 OUT_COPY=""
@@ -78,6 +92,7 @@ while [ $# -gt 0 ]; do
     --no-lint) DO_LINT=0 ;;
     --no-tests) DO_TESTS=0 ;;
     --no-review) DO_REVIEW=0 ;;
+    --coderabbit) CODERABBIT=1 ;;
     --model) MODEL="${2:?--model needs a value}"; shift ;;
     --effort) EFFORT="${2:?--effort needs a value}"; shift ;;
     --out) OUT_COPY="${2:?--out needs a value}"; shift ;;
@@ -110,6 +125,9 @@ if [ "$HEAD_REF" = "HEAD" ] && [ -n "$(git -C "$REPO" status --porcelain --untra
 fi
 
 [ -f "$BRIEF" ] || die "brief not found: $BRIEF"
+if [ "$CODERABBIT" -eq 1 ]; then
+  command -v coderabbit >/dev/null || die "--coderabbit: coderabbit CLI not found (brew install --cask coderabbit)"
+fi
 
 # --- package ----------------------------------------------------------------
 mkdir -p "$PKG_ROOT" "$CACHE"
@@ -157,6 +175,104 @@ if [ -f "$HOOK" ]; then
   echo "pr-review: hook    $HOOK"
 else
   echo "pr-review: no hook for $REPO_NAME (looked for .pr-review/hook.sh and $HOOK), using fallbacks"
+fi
+
+# Drop every variable of a calling Claude Code session so neither reviewer
+# can inherit its identity, sockets, or effort setting.
+SCRUB=()
+while IFS= read -r v; do SCRUB+=(-u "$v"); done < <(env | grep -o -E '^(CLAUDE[A-Z0-9_]*|USE_LOCAL_OAUTH|USE_STAGING_OAUTH|BAGGAGE|AI_AGENT)=' | tr -d '=')
+
+# --- CodeRabbit (optional, parallel) -----------------------------------------
+# run_coderabbit: reviews BASE_SHA..HEAD_SHA with the CodeRabbit CLI and
+# prints the exit code. The CLI needs a git worktree and computes the diff
+# itself from --base-commit, so it runs in the real checkout when HEAD is
+# reviewed and otherwise in a local clone with a branch at HEAD_SHA (the CLI
+# expects the base commit to be on the current branch). The clone carries
+# the checkout's remotes because CodeRabbit resolves organisation and
+# open-source status from them.
+run_coderabbit() {
+  local wt="$REPO" rc name
+  if [ "$HEAD_REF" != "HEAD" ]; then
+    wt="$OUT/coderabbit-worktree"
+    git clone -q --no-hardlinks --no-checkout "$REPO" "$wt"
+    git -C "$wt" fetch -q "$REPO" "$HEAD_SHA"
+    git -C "$wt" checkout -q -b pr-review "$HEAD_SHA"
+    for name in $(git -C "$REPO" remote); do
+      if [ "$name" = origin ]; then
+        git -C "$wt" remote set-url origin "$(git -C "$REPO" remote get-url origin)"
+      else
+        git -C "$wt" remote add "$name" "$(git -C "$REPO" remote get-url "$name")"
+      fi
+    done
+  fi
+  set +e
+  (
+    cd "$wt" &&
+    env ${SCRUB[@]+"${SCRUB[@]}"} coderabbit review --committed --base-commit "$BASE_SHA" < /dev/null
+  ) > "$OUT/coderabbit.raw.txt" 2> "$OUT/coderabbit.stderr"
+  rc=$?
+  set -e
+  # Plain text still carries colours and terminal hyperlinks; drop those and
+  # the "What's new" banner, keep the notices and the findings.
+  sed -E $'s/\x1b\\[[0-9;?]*[ -\\/]*[@-~]//g; s/\x1b\\]8;;[^\x1b\a]*(\a|\x1b\\\\)//g' "$OUT/coderabbit.raw.txt" \
+    | awk '/^CodeRabbit CLI [0-9]/ { skip = 1; next } skip && /^─+$/ { skip = 0; next } !skip' \
+    > "$OUT/coderabbit.txt"
+  echo "$rc"
+}
+
+# coderabbit_result_lines: the verdict lines of coderabbit.txt, if any.
+coderabbit_result_lines() {
+  grep -E -m4 '^(Review complete|[0-9]+ findings?|[0-9]+ files? reviewed|No findings)' "$OUT/coderabbit.txt" 2>/dev/null || true
+}
+
+# wait_coderabbit: joins the background run, kills it after the timeout,
+# leaves the exit code (or "timeout") in CR_RC.
+wait_coderabbit() {
+  local waited=0 limit="${PR_REVIEW_CODERABBIT_TIMEOUT:-900}"
+  [ -n "$CR_PID" ] || return 0
+  echo "pr-review: waiting for coderabbit ..."
+  while kill -0 "$CR_PID" 2>/dev/null; do
+    if [ "$waited" -ge "$limit" ]; then
+      pkill -P "$CR_PID" 2>/dev/null || true
+      kill "$CR_PID" 2>/dev/null || true
+      echo "timeout" > "$OUT/coderabbit.rc"
+      echo "(pr-review: killed after ${limit}s, PR_REVIEW_CODERABBIT_TIMEOUT)" >> "$OUT/coderabbit.txt"
+      break
+    fi
+    sleep 5; waited=$((waited + 5))
+  done
+  wait "$CR_PID" 2>/dev/null || true
+  CR_RC="$(cat "$OUT/coderabbit.rc" 2>/dev/null || echo unknown)"
+  CR_PID=""
+  echo "pr-review: coderabbit ${CR_RC/#[0-9]*/exit $CR_RC}"
+  coderabbit_result_lines | sed 's/^/  /'
+}
+
+# append_coderabbit: adds the CodeRabbit result to REVIEW.md.
+append_coderabbit() {
+  {
+    echo
+    echo "## CodeRabbit CLI (ran in parallel, not seen by the reviewer)"
+    echo
+    echo "${CR_RC/#[0-9]*/exit $CR_RC}, see coderabbit.txt"
+    echo
+    echo '```'
+    cat "$OUT/coderabbit.txt"
+    if [ "$CR_RC" != "0" ]; then
+      echo
+      echo "stderr (tail):"
+      tail -10 "$OUT/coderabbit.stderr"
+    fi
+    echo '```'
+  } >> "$OUT/REVIEW.md"
+}
+
+CR_PID=""; CR_RC=""
+if [ "$CODERABBIT" -eq 1 ]; then
+  [ "${PR_REVIEW_NO_CODERABBIT:-0}" != "1" ] || die "--coderabbit: refused by the hook for $REPO_NAME (PR_REVIEW_NO_CODERABBIT=1)"
+  echo "pr-review: running coderabbit in the background ..."
+  run_coderabbit > "$OUT/coderabbit.rc" &
+  CR_PID=$!
 fi
 
 # Fallback lint when the hook defines none.
@@ -250,17 +366,13 @@ echo "pr-review: summary"
 sed 's/^/  /' "$OUT/summary.txt"
 
 if [ "$DO_REVIEW" -eq 0 ]; then
+  wait_coderabbit
   echo "pr-review: package built, review skipped: $OUT"
   exit 0
 fi
 
 # --- reviewer ---------------------------------------------------------------
 command -v claude >/dev/null || die "claude CLI not found"
-
-# Drop every variable of a calling Claude Code session so the reviewer
-# cannot inherit its identity, sockets, or effort setting.
-SCRUB=()
-while IFS= read -r v; do SCRUB+=(-u "$v"); done < <(env | grep -o -E '^(CLAUDE[A-Z0-9_]*|USE_LOCAL_OAUTH|USE_STAGING_OAUTH|BAGGAGE|AI_AGENT)=' | tr -d '=')
 
 CLAUDE_ARGS=(
   -p
@@ -291,6 +403,7 @@ set -e
 if [ "$RC" -ne 0 ] || [ ! -s "$OUT/REVIEW.md" ]; then
   # The CLI prints auth and usage errors on stdout, so keep that out of REVIEW.md.
   [ -z "$TESTS_PID" ] || { wait "$TESTS_PID" || true; }
+  wait_coderabbit
   mv "$OUT/REVIEW.md" "$OUT/REVIEW.failed.txt"
   echo "pr-review: reviewer failed (exit $RC), see $OUT/REVIEW.failed.txt and reviewer.stderr" >&2
   { tail -5 "$OUT/REVIEW.failed.txt"; tail -5 "$OUT/reviewer.stderr"; } 2>/dev/null | sed 's/^/  /' >&2
@@ -317,6 +430,10 @@ if [ -n "$TESTS_PID" ]; then
   } >> "$OUT/REVIEW.md"
   echo "pr-review: tests ${TESTS_RC/#[0-9]*/exit $TESTS_RC}"
   test_result_lines | sed 's/^/  /'
+fi
+if [ -n "$CR_PID" ]; then
+  wait_coderabbit
+  append_coderabbit
 fi
 [ -n "$OUT_COPY" ] && cp "$OUT/REVIEW.md" "$OUT_COPY"
 echo "pr-review: review written to $OUT/REVIEW.md${OUT_COPY:+ (copy: $OUT_COPY)}"

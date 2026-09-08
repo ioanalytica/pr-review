@@ -58,6 +58,7 @@ pr-review --parallel               # tests run while the reviewer works
 pr-review --quick                  # tests narrowed to touched test files
 pr-review --no-review              # build the package only, no reviewer call
 pr-review --head fix/some-branch   # review a branch without checking it out
+pr-review --coderabbit             # CodeRabbit CLI as a second opinion, in parallel
 pr-review --out ./REVIEW.md upstream/main
 ```
 
@@ -113,6 +114,41 @@ The reviewer is `claude -p` started inside the package with:
 On a reviewer failure (auth, quota) the output is kept as
 `REVIEW.failed.txt` so an error page is never mistaken for a review.
 
+## CodeRabbit
+
+`--coderabbit` runs the [CodeRabbit CLI](https://docs.coderabbit.ai/cli)
+on the same commit range while the blind reviewer works, and appends its
+output to `REVIEW.md` under its own heading. The reviewer never sees it,
+so the two verdicts stay independent. On a fork whose pull requests are
+reviewed by CodeRabbit anyway, this front-loads that round before the
+push.
+
+Facts that shape the integration:
+
+- The CLI is a cloud service: the diff leaves the machine. The flag is
+  therefore opt-in per run, and a hook may set
+  `PR_REVIEW_NO_CODERABBIT=1` to refuse it for a repository.
+- It needs a git worktree and computes the diff itself, so it cannot
+  run inside the package's `src/`. It runs in the real checkout for
+  `HEAD` (`--committed`, so uncommitted edits are ignored) and, for
+  `--head REF`, in a local clone under the package with a branch at the
+  reviewed commit. The clone carries the checkout's remotes because
+  CodeRabbit resolves organisation, plan and open-source status from
+  them.
+- `--base-commit` takes the merge base, so the range matches
+  `changes.patch` exactly. The "Compare" line in the CLI output names
+  the remote default branch, not the base commit; the file list below
+  it is the authoritative scope.
+- Output: `coderabbit.txt` (colours, terminal hyperlinks and the
+  changelog banner stripped), `coderabbit.raw.txt`, `coderabbit.stderr`.
+- Rate limits are per plan and per hour (free open-source repositories:
+  a separate, lower limit). The run is cut off after
+  `PR_REVIEW_CODERABBIT_TIMEOUT` seconds (default 900).
+
+Setup: `brew install --cask coderabbit`, then `coderabbit auth login`
+once (browser) and `coderabbit doctor`. The token lives in
+`~/.coderabbit/auth.json`, so the call needs no terminal.
+
 ## Hooks
 
 A hook is a bash file that may define one or both of:
@@ -156,6 +192,9 @@ Shipped hooks:
 - `PR_REVIEW_DIR`: package root (default `$TMPDIR/pr-review`)
 - `PR_REVIEW_CONFIG`: config directory (default `~/.config/pr-review`)
 - `PR_REVIEW_CLAUDE_ARGS`: extra arguments for the reviewer call
+- `PR_REVIEW_CODERABBIT_TIMEOUT`: seconds to wait for the CodeRabbit CLI
+  (default 900)
+- `PR_REVIEW_NO_CODERABBIT`: set to `1` by a hook to refuse `--coderabbit`
 
 ## License
 
