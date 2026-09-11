@@ -5,7 +5,7 @@
 # Builds a self-contained review package from the current repository:
 #   changes.patch         diff merge-base(BASE, HEAD)..HEAD
 #   changed-files.txt     paths touched by the diff
-#   src/                  full tree at HEAD, no .git, no CLAUDE.md/.claude
+#   src/                  full tree at HEAD, no .git or assistant config
 #   lint.txt              output of the repo's lint layer (hook-driven)
 #   tests.txt             output of the repo's test layer (hook-driven)
 #   summary.txt           facts handed to the reviewer (shas, counts, rcs)
@@ -13,10 +13,9 @@
 #   REVIEW.md             the reviewer's verdict (unless --no-review)
 #   coderabbit.txt        CodeRabbit CLI review of the same range (--coderabbit)
 #
-# Then runs `claude -p` inside that package with read-only tools, no MCP
-# servers, no settings, no memory, no session persistence, and none of the
-# calling Claude Code session's environment. The reviewer sees the package
-# and nothing else: no branch name, no commit messages, no chat history.
+# Then runs Claude Code or Codex inside that package with read-only tools
+# or sandbox permissions and no session persistence. The review context
+# contains no branch name, commit messages, or chat history.
 #
 # Usage: pr-review [options] [BASE]
 #   BASE                 base ref (default: first of upstream/main, upstream/master,
@@ -27,11 +26,12 @@
 #                        does not see tests.txt, the result is appended to REVIEW.md
 #   --no-lint            skip the lint layer
 #   --no-tests           skip the test layer
-#   --no-review          build the package only, do not call claude
+#   --no-review          build the package only, do not call a reviewer
 #   --coderabbit         also run the CodeRabbit CLI on the same range, in
 #                        parallel; the reviewer does not see its output, the
 #                        result is appended to REVIEW.md (see below)
-#   --model M            reviewer model (default: claude's default)
+#   --provider P         anthropic (default) or openai
+#   --model M            reviewer model (default: fable / gpt-6-astra)
 #   --effort E           reviewer effort (default: high)
 #   --out FILE           copy REVIEW.md to FILE as well
 #   --hook FILE          hook file (default: .pr-review/hook.sh in the reviewed
@@ -57,7 +57,8 @@
 # --head. Needs `coderabbit auth login` once.
 #
 # Environment: PR_REVIEW_DIR (package root, default $TMPDIR/pr-review),
-# PR_REVIEW_CONFIG (config dir), PR_REVIEW_CLAUDE_ARGS (extra reviewer args),
+# PR_REVIEW_CONFIG (config dir), PR_REVIEW_PROVIDER (default provider),
+# PR_REVIEW_CLAUDE_ARGS / PR_REVIEW_CODEX_ARGS (extra provider CLI args),
 # PR_REVIEW_CODERABBIT_TIMEOUT (seconds to wait for CodeRabbit, default 900).
 #
 set -euo pipefail
@@ -76,6 +77,7 @@ DO_LINT=1
 DO_TESTS=1
 DO_REVIEW=1
 CODERABBIT=0
+PROVIDER="${PR_REVIEW_PROVIDER:-anthropic}"
 MODEL=""
 EFFORT="high"
 OUT_COPY=""
@@ -93,6 +95,7 @@ while [ $# -gt 0 ]; do
     --no-tests) DO_TESTS=0 ;;
     --no-review) DO_REVIEW=0 ;;
     --coderabbit) CODERABBIT=1 ;;
+    --provider) PROVIDER="${2:?--provider needs a value}"; shift ;;
     --model) MODEL="${2:?--model needs a value}"; shift ;;
     --effort) EFFORT="${2:?--effort needs a value}"; shift ;;
     --out) OUT_COPY="${2:?--out needs a value}"; shift ;;
@@ -103,6 +106,15 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+case "$PROVIDER" in
+  anthropic) REVIEWER=claude; MODEL="${MODEL:-fable}" ;;
+  openai) REVIEWER=codex; MODEL="${MODEL:-gpt-6-astra}" ;;
+  *) die "unknown provider: $PROVIDER (expected anthropic or openai)" ;;
+esac
+if [ "$DO_REVIEW" -eq 1 ]; then
+  command -v "$REVIEWER" >/dev/null || die "$REVIEWER CLI not found (required for --provider $PROVIDER)"
+fi
 
 # --- repository facts -------------------------------------------------------
 REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
@@ -151,9 +163,9 @@ N_FILES="$(wc -l < "$CHANGED_FILES" | tr -d ' ')"
 mkdir -p "$SRC"
 git -C "$REPO" archive --format=tar "$HEAD_SHA" | tar -x -C "$SRC"
 
-# Strip everything Claude Code would auto-load while reading src/, so the
+# Strip assistant configuration from src/, so the
 # reviewer sees the code and not the author's assistant instructions.
-STRIPPED="$(cd "$SRC" && find . \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name .claude -o -name .mcp.json \) -prune -print | sed 's|^\./||')"
+STRIPPED="$(cd "$SRC" && find . \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name .claude -o -name .mcp.json -o -name AGENTS.md -o -name AGENTS.override.md -o -name .codex -o -name .agents \) -prune -print | sed 's|^\./||')"
 if [ -n "$STRIPPED" ]; then
   while IFS= read -r p; do rm -rf "${SRC:?}/$p"; done <<< "$STRIPPED"
   printf '%s\n' "$STRIPPED" > "$OUT/stripped-from-src.txt"
@@ -177,10 +189,11 @@ else
   echo "pr-review: no hook for $REPO_NAME (looked for .pr-review/hook.sh and $HOOK), using fallbacks"
 fi
 
-# Drop every variable of a calling Claude Code session so neither reviewer
-# can inherit its identity, sockets, or effort setting.
+# Drop calling agent session variables. Keep CODEX_HOME for authentication.
 SCRUB=()
-while IFS= read -r v; do SCRUB+=(-u "$v"); done < <(env | grep -o -E '^(CLAUDE[A-Z0-9_]*|USE_LOCAL_OAUTH|USE_STAGING_OAUTH|BAGGAGE|AI_AGENT)=' | tr -d '=')
+while IFS= read -r v; do
+  [ "$v" = CODEX_HOME ] || SCRUB+=(-u "$v")
+done < <(env | grep -o -E '^(CLAUDE[A-Z0-9_]*|CODEX_[A-Z0-9_]*|USE_LOCAL_OAUTH|USE_STAGING_OAUTH|BAGGAGE|AI_AGENT)=' | tr -d '=')
 
 # --- CodeRabbit (optional, parallel) -----------------------------------------
 # run_coderabbit: reviews BASE_SHA..HEAD_SHA with the CodeRabbit CLI and
@@ -336,6 +349,7 @@ write_summary() {
   {
     echo "base:   $BASE_SHA"
     echo "head:   $HEAD_SHA"
+    echo "reviewer: $PROVIDER, model $MODEL, effort $EFFORT"
     echo "files:  $N_FILES changed (changed-files.txt)"
     echo "patch:  $(wc -l < "$OUT/changes.patch" | tr -d ' ') lines (changes.patch)"
     echo "lint:   ${LINT_RC/#[0-9]*/exit $LINT_RC} (lint.txt)"
@@ -346,6 +360,7 @@ write_summary() {
       test_result_lines | sed 's/^/        /'
     fi
     [ -f "$OUT/stripped-from-src.txt" ] && echo "note:   assistant config removed from src/ (stripped-from-src.txt)"
+    : # An empty stripped-file list is not a summary failure.
   } > "$OUT/summary.txt"
 }
 
@@ -372,31 +387,60 @@ if [ "$DO_REVIEW" -eq 0 ]; then
 fi
 
 # --- reviewer ---------------------------------------------------------------
-command -v claude >/dev/null || die "claude CLI not found"
-
-CLAUDE_ARGS=(
-  -p
-  --tools "Read,Grep,Glob"
-  --allowedTools "Read,Grep,Glob"
-  --permission-mode dontAsk
-  --strict-mcp-config
-  --setting-sources ""
-  --no-session-persistence
-  --effort "$EFFORT"
-  --output-format text
-)
-[ -n "$MODEL" ] && CLAUDE_ARGS+=(--model "$MODEL")
-if [ -n "${PR_REVIEW_CLAUDE_ARGS:-}" ]; then
-  # shellcheck disable=SC2206
-  CLAUDE_ARGS+=(${PR_REVIEW_CLAUDE_ARGS})
+if [ "$PROVIDER" = anthropic ]; then
+  REVIEWER_ARGS=(
+    -p
+    --tools "Read,Grep,Glob"
+    --allowedTools "Read,Grep,Glob"
+    --permission-mode dontAsk
+    --strict-mcp-config
+    --setting-sources ""
+    --no-session-persistence
+    --effort "$EFFORT"
+    --output-format text
+    --model "$MODEL"
+  )
+  if [ -n "${PR_REVIEW_CLAUDE_ARGS:-}" ]; then
+    # shellcheck disable=SC2206
+    REVIEWER_ARGS+=(${PR_REVIEW_CLAUDE_ARGS})
+  fi
+else
+  REVIEWER_ARGS=(
+    exec --ignore-user-config --ignore-rules --skip-git-repo-check
+    --ephemeral --sandbox read-only --color never
+    --model "$MODEL"
+    -c "model_reasoning_effort=$EFFORT"
+    -c 'approval_policy="never"'
+    -c 'project_doc_max_bytes=0'
+    -c 'web_search="disabled"'
+    -c 'shell_environment_policy.inherit="core"'
+    -c 'shell_environment_policy.ignore_default_excludes=false'
+    -c 'shell_environment_policy.experimental_use_profile=false'
+    --enable skip_host_skill_discovery
+    --disable plugins --disable apps --disable hooks --disable memories
+    --disable multi_agent --disable multi_agent_v2 --disable skill_search
+    --disable shell_snapshot --disable browser_use --disable computer_use
+    --output-last-message "$OUT/REVIEW.md"
+  )
+  if [ -n "${PR_REVIEW_CODEX_ARGS:-}" ]; then
+    # shellcheck disable=SC2206
+    REVIEWER_ARGS+=(${PR_REVIEW_CODEX_ARGS})
+  fi
 fi
 
-echo "pr-review: running reviewer (effort $EFFORT${MODEL:+, model $MODEL}) ..."
+echo "pr-review: running $PROVIDER reviewer (effort $EFFORT, model $MODEL) ..."
+# Codex writes its final message separately from its execution log. Create
+# the verdict file first so missing output follows the common failure path.
+: > "$OUT/REVIEW.md"
 set +e
 (
-  cd "$OUT" &&
-  env ${SCRUB[@]+"${SCRUB[@]}"} claude "${CLAUDE_ARGS[@]}" "$(cat BRIEF.md)" < /dev/null
-) > "$OUT/REVIEW.md" 2> "$OUT/reviewer.stderr"
+  cd "$OUT" || exit 1
+  if [ "$PROVIDER" = anthropic ]; then
+    env ${SCRUB[@]+"${SCRUB[@]}"} "$REVIEWER" "${REVIEWER_ARGS[@]}" "$(cat BRIEF.md)" < /dev/null > "$OUT/REVIEW.md"
+  else
+    env ${SCRUB[@]+"${SCRUB[@]}"} "$REVIEWER" "${REVIEWER_ARGS[@]}" - < BRIEF.md > "$OUT/reviewer.stdout"
+  fi
+) 2> "$OUT/reviewer.stderr"
 RC=$?
 set -e
 
@@ -406,6 +450,10 @@ if [ "$RC" -ne 0 ] || [ ! -s "$OUT/REVIEW.md" ]; then
   wait_coderabbit
   mv "$OUT/REVIEW.md" "$OUT/REVIEW.failed.txt"
   echo "pr-review: reviewer failed (exit $RC), see $OUT/REVIEW.failed.txt and reviewer.stderr" >&2
+  if [ "$PROVIDER" = openai ]; then
+    echo "pr-review: Codex execution log: $OUT/reviewer.stdout" >&2
+    tail -5 "$OUT/reviewer.stdout" | sed 's/^/  /' >&2
+  fi
   { tail -5 "$OUT/REVIEW.failed.txt"; tail -5 "$OUT/reviewer.stderr"; } 2>/dev/null | sed 's/^/  /' >&2
   exit 1
 fi

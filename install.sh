@@ -53,5 +53,15 @@ if command -v claude >/dev/null; then
     echo "install.sh: claude CLI found, run 'claude login' once before the first review"
   fi
 else
-  echo "install.sh: claude CLI not found, the reviewer step needs it (https://docs.claude.com/en/docs/claude-code)"
+  echo "install.sh: claude CLI not found (needed for --provider anthropic)"
+fi
+
+if command -v codex >/dev/null; then
+  if codex login status >/dev/null 2>&1; then
+    echo "install.sh: codex CLI found and logged in"
+  else
+    echo "install.sh: codex CLI found, run 'codex login' before using --provider openai"
+  fi
+else
+  echo "install.sh: codex CLI not found (needed for --provider openai; https://developers.openai.com/codex/cli/)"
 fi

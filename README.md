@@ -4,8 +4,9 @@ Blind, isolated review of a branch before it becomes a pull request.
 
 `pr-review` packages the diff against the base branch, the full source
 tree at the reviewed commit, the output of the repository's lint layer
-and the output of its test suite, then runs `claude -p` inside that
-package as an external reviewer with read-only tools and no context
+and the output of its test suite, then runs Claude Code (Anthropic) or
+Codex (OpenAI) inside that package as an external reviewer with read-only
+permissions and no context
 beyond the package. The reviewer is told to assume the diff is broken
 and must give `file:line` plus a failure scenario for every finding.
 The verdict lands in `REVIEW.md` inside the package, never in the
@@ -20,16 +21,21 @@ configuration.
 
 - bash 3.2 or newer, git, a POSIX `sed`, `mktemp`, `shasum` (macOS and
   Linux both qualify out of the box)
-- the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code)
+- for Anthropic: the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code)
   (`claude`) with its own login: run `claude login` once in a terminal.
   The desktop app's session does not carry over.
+- for OpenAI: the [Codex CLI](https://developers.openai.com/codex/cli/)
+  (`codex`), authenticated with `codex login`. Use a current version that
+  supports `--ignore-user-config`, `--ignore-rules`, `--ephemeral`, and
+  the `skip_host_skill_discovery` feature. Only the selected CLI is needed;
+  `--no-review` requires neither.
 - whatever the repository's hook needs. For `borg-ui`: Python 3 with
   `venv`, Node with `npm` (the hook fetches Node 22 through `npm exec`
   for CI parity), and a `frontend/node_modules` in the checkout or the
   patience for `npm ci`.
 - optional: `ruff` and `shellcheck` for the hook-less fallback lint
 
-A run costs real tokens on the account behind `claude login`. On
+A run uses the account authenticated with the selected CLI. On
 `borg-ui` a full run takes roughly 15 minutes with `--parallel`
 (unit suite about 9 minutes, reviewer about 14 minutes at effort
 `high`).
@@ -54,6 +60,9 @@ committed (only `HEAD` is reviewed, the working tree is ignored):
 
 ```bash
 pr-review                          # base = upstream/main, upstream/master, origin/main, ...
+pr-review --provider anthropic     # Claude Fable (default provider)
+pr-review --provider openai        # GPT-6 Astra via Codex
+pr-review --provider openai --effort xhigh
 pr-review --parallel               # tests run while the reviewer works
 pr-review --quick                  # tests narrowed to touched test files
 pr-review --no-review              # build the package only, no reviewer call
@@ -61,6 +70,21 @@ pr-review --head fix/some-branch   # review a branch without checking it out
 pr-review --coderabbit             # CodeRabbit CLI as a second opinion, in parallel
 pr-review --out ./REVIEW.md upstream/main
 ```
+
+### Reviewer selection
+
+`--provider anthropic` uses `claude -p --model fable`; `--provider openai`
+uses `codex exec --model gpt-6-astra`. The default is Anthropic. Set
+`PR_REVIEW_PROVIDER=openai` in your shell to change the default; an explicit
+`--provider` wins. `--model MODEL` overrides the selected provider's model,
+and `--effort LEVEL` is passed to that provider (default `high`). Use a
+level supported by the chosen model. Model access depends on your account.
+The model names follow the [Claude model catalog](https://platform.claude.com/docs/en/models/overview)
+and [GPT-6 Astra documentation](https://developers.openai.com/api/docs/models/gpt-6-astra).
+
+Both providers receive the same brief and package. The provider, model,
+and effort are recorded in `summary.txt`. Existing `--parallel`, `--quick`,
+`--head`, `--out`, and `--coderabbit` options work with either provider.
 
 `--parallel` roughly halves wall time. The trade-off: the reviewer is
 told that tests are still running and does not see `tests.txt`; the
@@ -96,7 +120,7 @@ the checkout.
 
 ## Isolation
 
-The reviewer is `claude -p` started inside the package with:
+For Anthropic, `claude -p` starts inside the package with:
 
 - `--tools Read,Grep,Glob` and the same allow-list: read-only
 - `--strict-mcp-config` without any config: no MCP servers
@@ -111,8 +135,28 @@ The reviewer is `claude -p` started inside the package with:
   a session that runs `pr-review` cannot leak its identity into the
   reviewer
 
-On a reviewer failure (auth, quota) the output is kept as
-`REVIEW.failed.txt` so an error page is never mistaken for a review.
+For OpenAI, `codex exec` runs in the package using a read-only sandbox,
+`approval_policy="never"`, and `--ephemeral`. User configuration and execution
+rules are ignored while the existing `CODEX_HOME` remains available for
+login. Project instructions, host skill discovery, plugins, apps, hooks,
+memory, subagents, browser/computer tools, web search, and shell snapshots
+are disabled. Shell commands inherit a minimal environment without secret
+variables or shell-profile loading. These options follow the
+[Codex CLI reference](https://developers.openai.com/codex/cli/reference/).
+
+Both providers strip `AGENTS.md`, `AGENTS.override.md`, `.codex/`, and
+`.agents/` in addition to the Claude configuration listed above. Calling
+`CODEX_*` session variables are also unset, except `CODEX_HOME` for login.
+The brief restricts the review to package inputs; read-only permissions
+are not a filesystem read jail. Administrator-managed CLI policies still
+apply. Custom extra CLI arguments can override these defaults.
+
+Codex's final message becomes `REVIEW.md`; its execution output is retained
+in `reviewer.stdout` and diagnostics in `reviewer.stderr`.
+
+On a reviewer failure (auth, quota), any verdict output is kept as
+`REVIEW.failed.txt`; Codex logs remain in `reviewer.stdout` and
+`reviewer.stderr`. An error page is never mistaken for a review.
 
 ## CodeRabbit
 
@@ -191,10 +235,21 @@ Shipped hooks:
 
 - `PR_REVIEW_DIR`: package root (default `$TMPDIR/pr-review`)
 - `PR_REVIEW_CONFIG`: config directory (default `~/.config/pr-review`)
-- `PR_REVIEW_CLAUDE_ARGS`: extra arguments for the reviewer call
+- `PR_REVIEW_PROVIDER`: default provider (`anthropic` or `openai`)
+- `PR_REVIEW_CLAUDE_ARGS`: extra arguments for Anthropic calls only
+- `PR_REVIEW_CODEX_ARGS`: extra arguments for OpenAI calls only
+  (both argument variables are whitespace-separated, not shell-evaluated;
+  embedded quoting is not supported)
 - `PR_REVIEW_CODERABBIT_TIMEOUT`: seconds to wait for the CodeRabbit CLI
   (default 900)
 - `PR_REVIEW_NO_CODERABBIT`: set to `1` by a hook to refuse `--coderabbit`
+
+## Development
+
+Run the offline integration tests with `python3 -m unittest discover -s tests -v`.
+They use temporary Git repositories and mock CLIs; no model calls are made.
+Check shell syntax and lint with `bash -n pr-review install.sh` and
+`shellcheck pr-review install.sh`.
 
 ## License
 
